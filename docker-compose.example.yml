@@ -1,0 +1,40 @@
+# cloudflared（自建精简版）示例配置
+#
+# 用法：
+#   cp docker-compose.example.yml docker-compose.yml
+#   cp .env.example .env          # 填 TUNNEL_TOKEN
+#   docker compose up -d
+#
+# 说明：
+#  - network_mode: host 是 cloudflared 官方推荐的部署方式（隧道本身就要出网，
+#    不需要映射端口；管理指标端口由 cloudflared 自己监听）。
+#    用 bridge 也可以，但要注意 metrics 端口与 DNS 解析。
+#  - TUNNEL_TOKEN 是 cloudflared 原生环境变量，无需额外脚本包装。
+#  - 镜像里没有 shell，要排障只能看 docker logs。
+
+services:
+  cloudflared:
+    image: ghcr.io/wliky/cloudflared:latest   # 生产建议钉死版本，如 :2026.10.0
+    container_name: cloudflared
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+      # 可选：如果 tunnel 需要额外配置（如 ingress 规则在本地而非云端）
+      # - TUNNEL_ORIGIN_CERT=/etc/cloudflared/cert.pem
+    command: tunnel run
+
+    # 只读根文件系统（镜像里没有任何需要写入的路径），进一步收紧权限
+    read_only: true
+
+    # scratch 镜像本来就极小，再压一层：不给多余能力
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

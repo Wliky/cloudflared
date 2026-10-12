@@ -1,0 +1,634 @@
+# =============================================================================
+# Wliky/cloudflared —— 从上游源码自建「极限精简」的 cloudflared 镜像，多架构推 GHCR
+#
+# 设计要点（都是踩过坑之后的结论，改之前先读完）：
+#
+#  1. Dockerfile 里**没有任何 RUN** → 不需要 QEMU。交叉编译在 runner 上原生完成，
+#     单平台构建只是「把已编好的二进制塞进 scratch」，秒级。
+#     （如果哪天往 Dockerfile 里加了 RUN，就必须补 docker/setup-qemu-action）
+#  2. 各架构编译完各自 buildx push 成 **digest**，最后由一个 merge job 用
+#     `imagetools create` 合成多架构 manifest（:版本 / :latest）。
+#  3. 判定「GHCR 是否已有该 tag」**必须带 Accept 头**，否则已存在也会返回 404。
+#  4. 输出用 **Docker manifest list** + Docker v2 per-arch manifest，而不是 OCI：
+#     `oci-mediatypes` 这个输入在手工指定 `outputs:` 时会被 docker/build-push-action
+#     **忽略**，必须直接写进 outputs 字符串（`type=image,...,oci-mediatypes=false`）。
+#     合并时配 `imagetools create --prefer-index=false`。
+#     理由：老版本 Docker（20.10.x 之类）对 Docker 原生格式的兼容性最稳。
+#  4b. 取 manifest 时 **Accept 头必须覆盖目标格式**，两个方向都会踩：
+#      * 用 Docker 的 Accept 去取 OCI index   -> 404 "OCI index found, but Accept
+#        header does not support OCI indexes"
+#      * 用 Docker 的 Accept 去取 OCI manifest -> 404
+#      所以下面的核验步骤把 Docker 与 OCI 两种类型都列进 Accept。
+#  5. Go 版本不手写，用 go-version-file 从**克隆下来的上游 go.mod** 读（上游会变）。
+#     注意读的是「被构建的那个 tag」而非 master：本仓库构建 2026.10.0 时读到的要求是
+#     go 1.26（而 master 已经是 1.27），setup-go 装到 go1.26.9，正好对上。
+#  6. 上游 Makefile 的 LINK_FLAGS 是空的 —— 官方二进制**根本没 strip**，
+#     这正是本镜像体积能砍掉一大块的原因（40MB → 27.7MB，约 31%），见 README。
+#  7. UPX 版的体积预期，别按直觉猜：
+#       二进制本身      25.4MB -> 8.7MB（省 66%）
+#       压缩后的层      只省约 10%
+#       解压落地后      25.4MB -> 8.7MB（省 66%）
+#     因为镜像层本来就是 gzip，而 Go 二进制的 gzip 压缩率本来就有 ~68%，
+#     UPX 输出又是压缩态、gzip 压不动。所以 UPX 省的是**磁盘**，不是**网络**。
+#     也因此「UPX 层的 digest 是否与标准版不同」才是内容未污染的判据，不能用体积比。
+#
+# 步骤顺序上有两处不能动（都踩过）：
+#   * UPX 必须先于「构建 UPX 版」、且**后于**「构建标准版」——否则标准版里装的会是
+#     打过包的二进制。现在两个版本用互不干扰的上下文（out/plain 与 out/upx）。
+#   * resolve 必须早于 build，build 早于 merge。
+#
+# 触发方式：
+#   * push 到 main            → 强制重建（改了构建脚本要让改动生效）
+#   * schedule 每月 10 日 03:17 UTC → 只在 GHCR 还没有上游最新 tag 时才构建
+#   * workflow_dispatch       → 可指定 version / force / upx
+# =============================================================================
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+  schedule:
+    - cron: '17 3 10 * *'   # 每月 10 日 11:17 北京时间
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '指定上游 tag（留空 = 自动取 cloudflare/cloudflared 最新 release）'
+        required: false
+        default: ''
+      force:
+        description: '强制重建（即使 GHCR 已有该 tag）'
+        type: boolean
+        default: false
+      upx:
+        description: '额外构建 UPX 压缩版（推 :upx 与 :<版本>-upx，不动 :latest）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 决定这一轮要不要构建，以及构建哪个版本
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.r.outputs.image }}
+      version: ${{ steps.r.outputs.version }}
+      build_time: ${{ steps.r.outputs.build_time }}
+      should_build: ${{ steps.r.outputs.should_build }}
+      upx: ${{ steps.r.outputs.upx }}
+      reason: ${{ steps.r.outputs.reason }}
+    steps:
+      - name: 解析上游版本并检查 GHCR
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_FORCE: ${{ inputs.force }}
+          IN_UPX: ${{ inputs.upx }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # GHCR 路径必须全小写（镜像名规范），owner 是 Wliky 所以要 tr
+          IMAGE="$(printf '%s' 'ghcr.io/${{ github.repository_owner }}/cloudflared' | tr '[:upper:]' '[:lower:]')"
+          REPO="${IMAGE#ghcr.io/}"
+
+          # ---- 版本：手动指定 > 上游最新 release
+          if [ -n "${IN_VERSION}" ]; then
+            VERSION="${IN_VERSION}"
+            SRC="手动指定"
+          else
+            VERSION="$(curl -fsSL \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              'https://api.github.com/repos/cloudflare/cloudflared/releases/latest' \
+              | jq -r '.tag_name')"
+            SRC="上游 latest release"
+          fi
+          if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+            echo "::error::无法解析上游版本号"; exit 1
+          fi
+
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # ---- UPX 只在手动 dispatch 时可控，其余事件一律 false
+          UPX="false"
+          if [ "${IN_UPX}" = "true" ]; then UPX="true"; fi
+
+          # ---- GHCR 是否已有该 tag（**必须带 Accept 头**）
+          EXISTS="no"
+          if [ "${IN_FORCE}" != "true" ]; then
+            TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" 2>/dev/null | jq -r '.token // empty' || true)"
+            if [ -n "${TOKEN}" ]; then
+              CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/${REPO}/manifests/${VERSION}" 2>/dev/null || echo 000)"
+              if [ "${CODE}" = "200" ]; then EXISTS="yes"; fi
+              echo "GHCR 探测 ${IMAGE}:${VERSION} -> HTTP ${CODE}"
+            else
+              echo "GHCR 匿名取 token 失败（包可能尚不存在）-> 视为需要构建"
+            fi
+          fi
+
+          # ---- 最终裁决
+          if [ "${EVENT}" = "push" ]; then
+            SHOULD=true; REASON="push 到 main：强制重建，使构建脚本改动生效"
+          elif [ "${IN_FORCE}" = "true" ]; then
+            SHOULD=true; REASON="手动 force=true"
+          elif [ "${EXISTS}" = "no" ]; then
+            SHOULD=true; REASON="GHCR 还没有 ${VERSION}"
+          else
+            SHOULD=false; REASON="GHCR 已有 ${VERSION}，跳过（要重建请用 force）"
+          fi
+
+          echo "版本=${VERSION}（来源：${SRC}）  构建时间=${BUILD_TIME}  UPX=${UPX}"
+          echo "是否构建=${SHOULD}  原因=${REASON}"
+
+          {
+            echo "### 构建决策"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 镜像 | \`${IMAGE}\` |"
+            echo "| 上游版本 | \`${VERSION}\`（${SRC}） |"
+            echo "| UPX 版 | \`${UPX}\` |"
+            echo "| 是否构建 | **${SHOULD}** — ${REASON} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "image=${IMAGE}"
+            echo "version=${VERSION}"
+            echo "build_time=${BUILD_TIME}"
+            echo "should_build=${SHOULD}"
+            echo "upx=${UPX}"
+            echo "reason=${REASON}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2) 逐架构交叉编译 → scratch 镜像 → 按 digest 推 GHCR
+  # ---------------------------------------------------------------------------
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            goarch: amd64
+            goarm: ''
+          - platform: linux/arm64
+            arch: arm64
+            goarch: arm64
+            goarm: ''
+          - platform: linux/arm/v7
+            arch: armv7
+            goarch: arm
+            goarm: '7'
+          - platform: linux/arm/v6
+            arch: armv6
+            goarch: arm
+            goarm: '6'
+          - platform: linux/386
+            arch: '386'
+            goarch: '386'
+            goarm: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 浅克隆上游（目标 tag）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${VERSION}" \
+            https://github.com/cloudflare/cloudflared.git src
+          echo "上游 commit: $(git -C src rev-parse HEAD)"
+          echo "上游 go 要求: $(grep -m1 '^go ' src/go.mod)"
+
+      - name: 安装上游要求的 Go 版本
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          check-latest: true
+          cache: false
+
+      - name: 交叉编译（CGO 关 / GOFIPS140=off / 注入版本）
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          BUILD_TIME: ${{ needs.resolve.outputs.build_time }}
+        run: |
+          set -euo pipefail
+          go version
+          mkdir -p out/plain
+          cd src
+          # 与上游 Makefile 对齐的三件事：
+          #   CGO_ENABLED=0            —— 静态、不依赖 glibc，才能用 scratch
+          #   GOFIPS140=off            —— 非 FIPS 构建，别把 FIPS 模块拉进来
+          #   -X metrics.Runtime=virtual —— 等价上游的 CONTAINER_BUILD=1（容器语义，metrics 绑法不同）
+          # 上游没做的两件事（体积就出在这里）：
+          #   -s -w                    —— strip 符号表与 DWARF
+          #   -buildid= -buildvcs=false —— 去掉 build id 与 VCS 戳
+          CGO_ENABLED=0 GOOS=linux GOFIPS140=off \
+            go build -trimpath -buildvcs=false \
+            -ldflags "-s -w -buildid= -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME} -X github.com/cloudflare/cloudflared/metrics.Runtime=virtual" \
+            -o ../out/plain/cloudflared ./cmd/cloudflared
+          cd ..
+          ls -l out/plain/cloudflared
+          file out/plain/cloudflared || true
+
+      - name: 准备构建上下文 · 标准版（CA 证书 / passwd / LICENSE）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/plain
+          CA=/etc/ssl/certs/ca-certificates.crt
+          if [ ! -f "${CA}" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ca-certificates
+          fi
+          if [ ! -f "${CA}" ]; then
+            CA=/tmp/ca-certificates.crt
+            curl -fsSL https://curl.se/ca/cacert.pem -o "${CA}"
+          fi
+          cp "${CA}" out/plain/ca-certificates.crt
+          # 我们再分发上游作品（Apache-2.0），必须随附 License 原文
+          if [ -f src/LICENSE ]; then
+            cp src/LICENSE out/plain/LICENSE
+          else
+            curl -fsSL "https://raw.githubusercontent.com/cloudflare/cloudflared/${VERSION}/LICENSE" -o out/plain/LICENSE
+          fi
+          printf 'nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin\n' > out/plain/passwd
+          printf 'nonroot:x:65532:\n' > out/plain/group
+          echo "标准版构建上下文："
+          ls -l out/plain/
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------
+      # 顺序很重要：**标准版必须先构建**。
+      # UPX 就地覆盖二进制，若把它排在前面，标准版镜像里装的会是打过包的二进制
+      #（曾真的踩到：两个 tag 内容完全一样、体积降幅 0%）。
+      # 现在更进一步用两个互不干扰的构建上下文（out/plain 与 out/upx），
+      # 从结构上让这种污染不可能发生。
+      # ---------------------------------------------------------------------
+      - name: 构建并推送 · 标准版（按 digest）
+        id: b_plain
+        uses: docker/build-push-action@v6
+        with:
+          context: ./out/plain
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ needs.resolve.outputs.image }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            BUILD_TIME=${{ needs.resolve.outputs.build_time }}
+            UPX=0
+
+      - name: UPX 压缩（可选，dispatch 时 upx=true 才跑）
+        if: needs.resolve.outputs.upx == 'true'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq upx-ucl
+          upx --version | head -2
+          # 从标准版上下文**拷一份**再打包，绝不碰 out/plain 里的原件
+          rm -rf out/upx
+          cp -a out/plain out/upx
+          BEFORE=$(stat -c %s out/upx/cloudflared)
+          # -9 == --best；不加 --lzma：部分 ELF 目标不支持，宁可稳
+          if ! upx -9 out/upx/cloudflared; then
+            echo "::error::UPX 打包失败（该架构/该二进制不支持），中止以免推出名不副实的 -upx 镜像"
+            exit 1
+          fi
+          AFTER=$(stat -c %s out/upx/cloudflared)
+          RATIO=$(( 100 - AFTER * 100 / BEFORE ))
+          echo "UPX: ${BEFORE} → ${AFTER} (省 ${RATIO}%)"
+          echo "校验：标准版上下文里的原件必须没被动过 -> $(stat -c %s out/plain/cloudflared) 字节"
+          test "$(stat -c %s out/plain/cloudflared)" -eq "${BEFORE}" || {
+            echo "::error::out/plain 里的二进制被改动了，标准版会被污染"; exit 1; }
+          {
+            echo "| ${PLATFORM} | $(numfmt --to=iec "${BEFORE}") | $(numfmt --to=iec "${AFTER}") | ${RATIO}% |"
+          } >> /tmp/upx-table-row.txt
+
+      - name: 上报 UPX 体积行
+        if: needs.resolve.outputs.upx == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upx-row-${{ matrix.arch }}
+          path: /tmp/upx-table-row.txt
+          if-no-files-found: ignore
+
+      - name: 构建并推送 · UPX 版（按 digest）
+        id: b_upx
+        if: needs.resolve.outputs.upx == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./out/upx
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ needs.resolve.outputs.image }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false
+          build-args: |
+            VERSION=${{ needs.resolve.outputs.version }}
+            BUILD_TIME=${{ needs.resolve.outputs.build_time }}
+            UPX=1
+
+      - name: 收集 digest
+        env:
+          D_PLAIN: ${{ steps.b_plain.outputs.digest }}
+          D_UPX: ${{ steps.b_upx.outputs.digest }}
+          UPX: ${{ needs.resolve.outputs.upx }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/plain-${D_PLAIN#sha256:}"
+          echo "标准版 ${{ matrix.arch }} digest=${D_PLAIN}"
+          if [ "${UPX}" = "true" ] && [ -n "${D_UPX}" ]; then
+            touch "/tmp/digests/upx-${D_UPX#sha256:}"
+            echo "UPX 版 ${{ matrix.arch }} digest=${D_UPX}"
+          fi
+          ls -l /tmp/digests
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3) 合成多架构 manifest，并做匿名可拉取 + 体积核验
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [resolve, build]
+    if: always() && needs.resolve.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR（imagetools 推送需要）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 合成多架构 manifest
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          UPX: ${{ needs.resolve.outputs.upx }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          PLAIN=()
+          for f in /tmp/digests/plain-*; do
+            b="$(basename "$f")"
+            PLAIN+=("${IMAGE}@sha256:${b#plain-}")
+          done
+          echo "标准版架构数：${#PLAIN[@]}"
+          printf '  %s\n' "${PLAIN[@]}"
+          if [ "${#PLAIN[@]}" -lt 5 ]; then
+            echo "::error::架构数不足 5，拒绝合成（避免推出缺架构的 manifest）"; exit 1
+          fi
+
+          # --prefer-index=false => 产出 Docker manifest list 而非 OCI index
+          docker buildx imagetools create --prefer-index=false \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:sha-${SHA:0:7}" \
+            "${PLAIN[@]}"
+
+          if [ "${UPX}" = "true" ]; then
+            UPXREF=()
+            for f in /tmp/digests/upx-*; do
+              b="$(basename "$f")"
+              UPXREF+=("${IMAGE}@sha256:${b#upx-}")
+            done
+            echo "UPX 版架构数：${#UPXREF[@]}"
+            if [ "${#UPXREF[@]}" -lt 5 ]; then
+              echo "::error::UPX 版架构数不足 5"; exit 1
+            fi
+            docker buildx imagetools create --prefer-index=false \
+              -t "${IMAGE}:${VERSION}-upx" \
+              -t "${IMAGE}:upx" \
+              "${UPXREF[@]}"
+          fi
+
+      - name: 核验（匿名可拉 + 各架构体积）
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          UPX: ${{ needs.resolve.outputs.upx }}
+        run: |
+          set -euo pipefail
+          REPO="${IMAGE#ghcr.io/}"
+
+          echo "=== :${VERSION} 的平台清单（buildx 视角）==="
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+          # ---- 1) 用**匿名** token 取 manifest。这同时就是「包是否公开」的判定：
+          #         私有包在这里只会拿到 403 DENIED。
+          TOK_CODE="$(curl -s -o /tmp/tok.json -w '%{http_code}' \
+            "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io")"
+          TOKEN="$(jq -r '.token // empty' /tmp/tok.json 2>/dev/null || true)"
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::匿名获取 pull token 失败（HTTP ${TOK_CODE}）—— 包很可能仍是私有的"
+            echo "  处置：打开 https://github.com/users/${REPO%%/*}/packages/container/${REPO##*/}/settings"
+            echo "        在页面底部 Danger Zone 把 visibility 改成 Public，重跑本步即可。"
+            exit 1
+          fi
+          echo "匿名 token 获取成功（HTTP ${TOK_CODE}）-> 包对外可读"
+
+          # ---- 2) 读多架构索引。Accept 必须覆盖目标格式。
+          IDX_ACC='application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json'
+          IDX_CODE="$(curl -s -o /tmp/idx.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${IDX_ACC}" \
+            "https://ghcr.io/v2/${REPO}/manifests/${VERSION}")"
+          echo "匿名读取索引 ${VERSION} -> HTTP ${IDX_CODE}"
+          if [ "${IDX_CODE}" != "200" ]; then
+            echo "::error::匿名读取多架构索引失败（HTTP ${IDX_CODE}）"; exit 1
+          fi
+
+          MT="$(jq -r '.mediaType' /tmp/idx.json)"
+          case "${MT}" in
+            application/vnd.docker.distribution.manifest.list.v2+json) KIND="Docker manifest list（老 Docker 兼容性最好）" ;;
+            application/vnd.oci.image.index.v1+json)                  KIND="OCI image index" ;;
+            *)                                                        KIND="未知类型" ;;
+          esac
+          echo "索引类型 = ${MT}  ->  ${KIND}"
+
+          # ---- 3) 平台集合必须完整，否则宁可红也不要静默推出缺架构的镜像
+          PLATS="$(jq -r '.manifests[].platform | "\(.os)/\(.architecture)\(if .variant then "/"+.variant else "" end)"' /tmp/idx.json | LC_ALL=C sort)"
+          EXPECT="$(printf 'linux/386\nlinux/amd64\nlinux/arm/v6\nlinux/arm/v7\nlinux/arm64\n')"
+          echo "包含平台："; printf '%s\n' "${PLATS}" | sed 's/^/  /'
+          if [ "${PLATS}" != "${EXPECT}" ]; then
+            echo "::error::平台集合与预期不符"
+            echo "--- 实际 ---"; printf '%s\n' "${PLATS}"
+            echo "--- 期望 ---"; printf '%s\n' "${EXPECT}"
+            exit 1
+          fi
+          echo "平台集合完整（5 个架构全在）"
+
+          # ---- 4) 逐架构取 per-arch manifest 算体积。
+          # 坑：per-arch manifest 可能是 Docker v2 也可能是 OCI，Accept 只给一种就会 404。
+          MAN_ACC='application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json'
+
+          # scan <tag> <逐架构行输出文件>  ->  stdout 打印 5 架构合计字节数
+          # 每行：平台 压缩层合计 最大层(即二进制层)的 digest
+          # 注意用 while + read 配合**进程替换**而非管道，否则 total 会丢在子 shell 里
+          scan() {
+            local tag="$1" out="$2" total=0 plat digest c top
+            : > "${out}"
+            while read -r plat digest; do
+              [ -n "${plat}" ] || continue
+              if ! curl -fsSL -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${MAN_ACC}" \
+                   "https://ghcr.io/v2/${REPO}/manifests/${digest}" -o /tmp/man.json; then
+                echo "::error::读取 ${tag} 的 ${plat} manifest 失败（digest ${digest}）" >&2
+                return 1
+              fi
+              c="$(jq '[.layers[].size] | add // 0' /tmp/man.json)"
+              top="$(jq -r '[.layers[]] | max_by(.size) | .digest' /tmp/man.json)"
+              printf '%s %s %s\n' "${plat}" "${c}" "${top}" >> "${out}"
+              total=$(( total + c ))
+            done < <(curl -fsSL -H "Authorization: Bearer ${TOKEN}" -H "Accept: ${IDX_ACC}" \
+                       "https://ghcr.io/v2/${REPO}/manifests/${tag}" \
+                     | jq -r '.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)\(if .platform.variant then "/"+.platform.variant else "" end) \(.digest)"')
+            echo "${total}"
+          }
+
+          PLAIN_TOTAL="$(scan "${VERSION}" /tmp/sizes-plain.txt)"
+
+          {
+            echo ""
+            echo "### 核验结果"
+            echo ""
+            echo "- 索引类型：\`${MT}\` — ${KIND}"
+            echo "- 匿名可拉取：✅（未携带任何凭据即读到索引）"
+            echo "- 平台：5/5 完整"
+            echo ""
+            echo "**标准版 \`:${VERSION}\`** — 合计 $(numfmt --to=iec "${PLAIN_TOTAL}")"
+            echo ""
+            echo "| 平台 | 拉取体积（各层压缩合计） |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r plat c _; do
+            echo "  ${plat}: $(numfmt --to=iec "${c}")B"
+            echo "| ${plat} | $(numfmt --to=iec "${c}") |" >> "$GITHUB_STEP_SUMMARY"
+          done < /tmp/sizes-plain.txt
+
+          if [ "${UPX}" = "true" ]; then
+            UPX_TOTAL="$(scan "${VERSION}-upx" /tmp/sizes-upx.txt)"
+            echo ""
+            echo "=== UPX 版 :${VERSION}-upx ==="
+            {
+              echo ""
+              echo "**UPX 版 \`:${VERSION}-upx\`** — 合计 $(numfmt --to=iec "${UPX_TOTAL}")"
+              echo ""
+              echo "| 平台 | 标准版（拉取体积） | UPX 版（拉取体积） | 降幅 |"
+              echo "|---|---|---|---|"
+            } >> "$GITHUB_STEP_SUMMARY"
+            while read -r plat c _; do
+              p="$(awk -v k="${plat}" '$1==k {print $2}' /tmp/sizes-plain.txt)"
+              if [ -n "${p}" ]; then r="$(( 100 - c * 100 / p ))%"; else r="-"; fi
+              echo "  ${plat}: $(numfmt --to=iec "${c}")B（省 ${r}）"
+              echo "| ${plat} | $(numfmt --to=iec "${p}") | $(numfmt --to=iec "${c}") | ${r} |" >> "$GITHUB_STEP_SUMMARY"
+            done < /tmp/sizes-upx.txt
+
+            # 断言（精确判据）：UPX 版与标准版的**最大层（=二进制层）digest 必须不同**。
+            #
+            # 为什么不拿体积当判据：镜像层是 gzip 的，而 Go 二进制的 gzip 压缩率本来就有
+            # ~68%，UPX 输出又已是压缩态、gzip 几乎压不动 —— 所以两者**压缩后**体积只差
+            # 约 10%（实测合计 49.06MB -> 44.84MB）。之前用「必须小 15%」当阈值，
+            # 结果把正常的 UPX 构建误判为失败。
+            #
+            # 而 digest 是否相同能精确回答「内容有没有被污染」：
+            # 曾经因为 UPX 就地覆盖二进制且排在标准版之前构建，两个 tag 内容一模一样。
+            dirty=0
+            while read -r plat c dg; do
+              pdig="$(awk -v k="${plat}" '$1==k {print $3}' /tmp/sizes-plain.txt)"
+              if [ -z "${pdig}" ]; then
+                echo "::error::标准版里找不到平台 ${plat}"; dirty=1; continue
+              fi
+              if [ "${dg}" = "${pdig}" ]; then
+                echo "::error::${plat} 的 UPX 版与标准版二进制层 digest 相同（${dg}）——构建上下文被污染"
+                dirty=1
+              fi
+            done < /tmp/sizes-upx.txt
+            [ "${dirty}" -eq 0 ] || exit 1
+            echo "断言通过：5 个架构的 UPX 版与标准版二进制层 digest 全都不同"
+            if [ "${UPX_TOTAL}" -ge "${PLAIN_TOTAL}" ]; then
+              echo "::warning::UPX 版合计压缩体积未小于标准版（该架构 UPX 可能无收益）"
+            else
+              echo "提示：UPX 主要省的是**解压落地后的磁盘占用**（二进制 25.4MB -> 8.7MB），"
+              echo "      下载体积只省 $(( 100 - UPX_TOTAL * 100 / PLAIN_TOTAL ))%——因为层本身就是 gzip。"
+            fi
+          fi
+
+          echo ""
+          echo "=== 最终 tag ==="
+          echo "  ${IMAGE}:${VERSION}   ${IMAGE}:latest   ${IMAGE}:sha-${GITHUB_SHA:0:7}"
+          if [ "${UPX}" = "true" ]; then
+            echo "  ${IMAGE}:${VERSION}-upx   ${IMAGE}:upx"
+          fi
+
+      - name: 汇总 UPX 体积
+        if: needs.resolve.outputs.upx == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: upx-row-*
+          path: /tmp/upx-rows
+          merge-multiple: true
+
+      - name: 写入 UPX 表格
+        if: needs.resolve.outputs.upx == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo ""
+            echo "### UPX 压缩前后"
+            echo ""
+            echo "| 平台 | 压缩前 | 压缩后 | 降幅 |"
+            echo "|---|---|---|---|"
+            cat /tmp/upx-rows/*.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"

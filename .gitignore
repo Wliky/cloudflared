@@ -1,0 +1,11 @@
+# CI 在构建前生成的产物目录（二进制 / CA / passwd / LICENSE）
+/out/
+
+# 本机临时
+*.log
+/tmp/
+/_logs/
+/_tmp/
+
+# 环境变量（含 TUNNEL_TOKEN），绝不提交
+.env
